@@ -1,11 +1,11 @@
 """
-Data-Analyst Telegram Bot — v3.
-New in v3:
-  - run_python now has PRELOADED helpers (read_tables, get_text) and
-    pre-imported pandas/requests/BeautifulSoup/StringIO, so the model
-    cannot fumble user-agents or StringIO wrapping.
-  - If the agent hits the round cap, it is forced to produce a final
-    JSON answer from what it has learned (no more "loop limit" replies).
+Data-Analyst Telegram Bot — v3.1.
+New in v3.1:
+  - Replies now match the exact JSON shape each question asks for: the
+    {"answer": ..., "log_url": ...} envelope is applied only when the
+    question mentions log_url; otherwise the bare shape is returned.
+v3 recap: preloaded data helpers (read_tables, get_text) inside
+run_python; forced final answer when the round cap is hit.
 v2 recap: instant webhook ack + background task (no duplicate replies),
 duplicate update_id protection, strict anti-fabrication system prompt.
 
@@ -163,22 +163,35 @@ RULES — follow all of them:
 6. In multi-turn conversations, answer the LATEST message, using earlier
    messages as context.
 7. Your FINAL reply must be EXACTLY one JSON object matching the shape the
-   question asks for, e.g. {"answer": {...}} — no prose, no markdown
-   fences, no explanations around it.
+   question asks for — no prose, no markdown fences, no explanations
+   around it. Match the requested shape precisely: if the question shows
+   {"state": "..."}, reply with exactly that shape; if it shows an
+   {"answer": ..., "log_url": ...} envelope, use that.
 8. Do not invent the log_url; the server fills it in."""
 
 
-def _parse_final(raw: str) -> dict:
-    """Turn the model's final text into our answer object."""
+def _parse_final(raw: str, question: str = "") -> dict:
+    """Turn the model's final text into the reply object, matching the
+    shape the question asked for. Only add the answer/log_url envelope
+    when the question mentions log_url."""
     raw = (raw or "").strip()
     raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     try:
         obj = json.loads(raw)
-        if "answer" not in obj:            # tolerate {"state": ...} etc.
-            obj = {"answer": obj}
     except json.JSONDecodeError:
-        obj = {"answer": raw}              # last-resort fallback
-    obj["log_url"] = LOG_URL               # server owns this field
+        return {"answer": raw, "log_url": LOG_URL}   # unparseable fallback
+    wants_envelope = "log_url" in question
+    if wants_envelope:
+        if not (isinstance(obj, dict) and "answer" in obj):
+            obj = {"answer": obj}
+        obj["log_url"] = LOG_URL                     # server owns this field
+        return obj
+    # Question wants a bare shape: unwrap if the model added the envelope.
+    if isinstance(obj, dict) and "answer" in obj and \
+            set(obj.keys()) <= {"answer", "log_url"}:
+        return obj["answer"] if isinstance(obj["answer"], dict) else obj
+    if isinstance(obj, dict):
+        obj.pop("log_url", None)
     return obj
 
 
@@ -222,7 +235,7 @@ async def run_agent(chat_id: int, question: str) -> str:
             continue  # let the model see the tool results
 
         # No tool calls -> this is the final answer.
-        obj = _parse_final(msg.get("content"))
+        obj = _parse_final(msg.get("content"), question)
         log({"event": "final_answer", "answer": obj})
         return json.dumps(obj)
 
@@ -233,7 +246,7 @@ async def run_agent(chat_id: int, question: str) -> str:
         "NOW with only the final JSON object in the required shape."})
     try:
         msg = await call_llm(history)
-        obj = _parse_final(msg.get("content"))
+        obj = _parse_final(msg.get("content"), question)
         log({"event": "final_answer_forced", "answer": obj})
         return json.dumps(obj)
     except Exception as e:
