@@ -1,23 +1,26 @@
 """
-Data-Analyst Telegram Bot — v2.
-Fixes over v1:
-  - Webhook now acknowledges Telegram INSTANTLY and runs the agent in the
-    background (prevents Telegram retry -> duplicate replies).
-  - Duplicate update_ids are ignored (belt-and-braces against retries).
-  - Agent loop cap raised to 15.
-  - Stronger system prompt: the model must verify with tools, not guess.
+Data-Analyst Telegram Bot — v3.
+New in v3:
+  - run_python now has PRELOADED helpers (read_tables, get_text) and
+    pre-imported pandas/requests/BeautifulSoup/StringIO, so the model
+    cannot fumble user-agents or StringIO wrapping.
+  - If the agent hits the round cap, it is forced to produce a final
+    JSON answer from what it has learned (no more "loop limit" replies).
+v2 recap: instant webhook ack + background task (no duplicate replies),
+duplicate update_id protection, strict anti-fabrication system prompt.
 
-Environment variables you must set on your host:
-  TELEGRAM_TOKEN  - from @BotFather
-  LLM_API_KEY     - your LLM provider key
-  PUBLIC_URL      - your deployed base URL, e.g. https://tdsp1q5.onrender.com
+Environment variables (set on the host):
+  TELEGRAM_TOKEN, LLM_API_KEY, PUBLIC_URL
 
 Run locally:  python -m uvicorn bot:app --port 8000
 Set webhook:  https://api.telegram.org/bot<TOKEN>/setWebhook?url=<PUBLIC_URL>/webhook
 """
 
 import os, io, json, contextlib, traceback
+from io import StringIO
 import httpx
+import requests as _requests
+import pandas as _pd
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import FileResponse
 
@@ -28,6 +31,10 @@ LLM_ENDPOINT = "https://aipipe.org/openai/v1/chat/completions"
 MODEL = "gpt-5-mini"
 LOG_PATH = "run.jsonl"
 LOG_URL = f"{PUBLIC_URL}/run.jsonl"
+
+BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                 "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                 "Chrome/126.0 Safari/537.36"}
 
 app = FastAPI()
 chat_histories: dict[int, list] = {}  # chat_id -> message history (multi-turn!)
@@ -53,24 +60,57 @@ def health():
     return {"status": "ok"}  # useful for uptime pingers
 
 
+# ------------- Helpers preloaded into the agent's Python -------------
+
+def _get_text(url: str, timeout: int = 60) -> str:
+    """Fetch a URL with browser-like headers; return the response text."""
+    r = _requests.get(url, headers=BROWSER_HEADERS, timeout=timeout,
+                      allow_redirects=True)
+    r.raise_for_status()
+    return r.text
+
+
+def _read_tables(url: str, timeout: int = 60):
+    """Fetch a web page and return all its tables as a list of DataFrames.
+    Handles user-agent headers and StringIO wrapping correctly."""
+    return _pd.read_html(StringIO(_get_text(url, timeout)))
+
+
 # ---------------------- The agent's tools ----------------------
 
 def run_python(code: str) -> str:
-    """Execute Python and return stdout (or the traceback)."""
+    """Execute Python and return stdout (or the traceback).
+    The namespace comes preloaded with helpers and common imports."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        BeautifulSoup = None
+    namespace = {
+        "__name__": "__main__",
+        "pd": _pd, "pandas": _pd,
+        "requests": _requests,
+        "StringIO": StringIO,
+        "BeautifulSoup": BeautifulSoup,
+        "read_tables": _read_tables,
+        "get_text": _get_text,
+        "BROWSER_HEADERS": BROWSER_HEADERS,
+    }
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
-            exec(code, {"__name__": "__main__"})
+            exec(code, namespace)
         return buf.getvalue()[:8000] or "(no output — use print())"
     except Exception:
-        return "ERROR:\n" + traceback.format_exc()[:4000]
+        out = buf.getvalue()[:3000]
+        return (out + "\nERROR:\n" if out else "ERROR:\n") \
+            + traceback.format_exc()[:4000]
 
 
 def fetch_url(url: str) -> str:
     """Download a page/dataset so the model can inspect it."""
     try:
         r = httpx.get(url, timeout=60, follow_redirects=True,
-                      headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+                      headers=BROWSER_HEADERS)
         return r.text[:8000]
     except Exception as e:
         return f"ERROR: {e}"
@@ -79,7 +119,12 @@ def fetch_url(url: str) -> str:
 TOOLS = [
     {"type": "function", "function": {
         "name": "run_python",
-        "description": "Run Python code (pandas/httpx available). Print results.",
+        "description": ("Run Python code. PRELOADED in the namespace: "
+                        "pd (pandas), requests, StringIO, BeautifulSoup, "
+                        "read_tables(url) -> list of DataFrames from a web "
+                        "page's tables (handles headers/parsing for you), "
+                        "get_text(url) -> page text with browser headers. "
+                        "Always print() what you want to see."),
         "parameters": {"type": "object", "properties": {
             "code": {"type": "string"}}, "required": ["code"]}}},
     {"type": "function", "function": {
@@ -97,30 +142,42 @@ RULES — follow all of them:
    it is the worst possible failure. If you cannot obtain real data after
    genuine attempts, answer from your best knowledge as a last resort and
    never from an invented table.
-2. To find real data: fetching a site's homepage is useless (it returns
-   navigation HTML, not data). Use targeted sources instead — data.gov.in's
-   API (https://api.data.gov.in) or catalog search
-   (https://data.gov.in/search?title=<keywords>), Wikipedia tables
-   (pd.read_html handles them well), or direct CSV/XLSX/JSON links. If a
-   fetch returns homepage-like HTML or an error, do NOT retry the same URL
-   — change the URL or the strategy. 
-   When using pd.read_html: fetch the page with
-   requests.get(url, headers={"User-Agent": "Mozilla/5.0"}), then parse via
-   from io import StringIO; tables = pd.read_html(StringIO(response.text))
-   — passing response.text directly will fail on modern pandas.
-3. In run_python you MUST print() anything you want to see; a bare
-   expression on the last line shows nothing. Print your results and READ
-   the output before drawing any conclusion from it.
-4. Work step by step: locate the data, load it, compute, then sanity-check.
-   If entity names look generic ("State A", "Category 1") or values look
-   fabricated, the data is WRONG — discard it and find the true source.
-   Verify your final answer is plausible before replying.
-5. In multi-turn conversations, answer the LATEST message, using earlier
+2. In run_python these are ALREADY available (do not re-import or redefine):
+   pd (pandas), requests, StringIO, BeautifulSoup, and two helpers:
+     read_tables(url)  -> list of DataFrames from all tables on a web page
+     get_text(url)     -> page text fetched with proper browser headers
+   For tabular web data (e.g. Wikipedia lists), read_tables(url) is the
+   fastest reliable route: call it, print the tables, pick the right one.
+3. Finding data: homepages are useless (navigation HTML, not data). Use
+   targeted pages — a specific Wikipedia list article, data.gov.in API
+   (https://api.data.gov.in), or direct CSV/XLSX/JSON links. If a source
+   fails, do NOT retry the same URL — change the URL or strategy.
+4. Always print() what you want to see and READ the output before drawing
+   conclusions. Work step by step: locate, load, compute, sanity-check.
+   If entity names look generic ("State A") or values look fabricated,
+   the data is WRONG — discard it and find the true source.
+5. Be efficient: you have a limited number of steps. Prefer one
+   read_tables call over many exploratory fetches.
+6. In multi-turn conversations, answer the LATEST message, using earlier
    messages as context.
-6. Your FINAL reply must be EXACTLY one JSON object matching the shape the
+7. Your FINAL reply must be EXACTLY one JSON object matching the shape the
    question asks for, e.g. {"answer": {...}} — no prose, no markdown
    fences, no explanations around it.
-7. Do not invent the log_url; the server fills it in."""
+8. Do not invent the log_url; the server fills it in."""
+
+
+def _parse_final(raw: str) -> dict:
+    """Turn the model's final text into our answer object."""
+    raw = (raw or "").strip()
+    raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        obj = json.loads(raw)
+        if "answer" not in obj:            # tolerate {"state": ...} etc.
+            obj = {"answer": obj}
+    except json.JSONDecodeError:
+        obj = {"answer": raw}              # last-resort fallback
+    obj["log_url"] = LOG_URL               # server owns this field
+    return obj
 
 
 async def call_llm(messages: list) -> dict:
@@ -163,20 +220,24 @@ async def run_agent(chat_id: int, question: str) -> str:
             continue  # let the model see the tool results
 
         # No tool calls -> this is the final answer.
-        raw = (msg.get("content") or "").strip()
-        raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        try:
-            obj = json.loads(raw)
-            if "answer" not in obj:            # tolerate {"state": ...} etc.
-                obj = {"answer": obj}
-        except json.JSONDecodeError:
-            obj = {"answer": raw}              # last-resort fallback
-        obj["log_url"] = LOG_URL               # server owns this field
+        obj = _parse_final(msg.get("content"))
         log({"event": "final_answer", "answer": obj})
         return json.dumps(obj)
 
+    # Out of rounds — force a final answer from what we have.
     log({"event": "loop_limit_reached", "chat_id": chat_id})
-    return json.dumps({"answer": "agent loop limit reached", "log_url": LOG_URL})
+    history.append({"role": "user", "content":
+        "You are out of tool budget. Using everything learned so far, reply "
+        "NOW with only the final JSON object in the required shape."})
+    try:
+        msg = await call_llm(history)
+        obj = _parse_final(msg.get("content"))
+        log({"event": "final_answer_forced", "answer": obj})
+        return json.dumps(obj)
+    except Exception as e:
+        log({"event": "llm_error", "error": str(e)})
+        return json.dumps({"answer": "unable to determine",
+                           "log_url": LOG_URL})
 
 
 # ---------------------- Telegram plumbing ----------------------
