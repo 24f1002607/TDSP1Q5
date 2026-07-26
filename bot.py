@@ -69,7 +69,8 @@ def run_python(code: str) -> str:
 def fetch_url(url: str) -> str:
     """Download a page/dataset so the model can inspect it."""
     try:
-        r = httpx.get(url, timeout=30, follow_redirects=True)
+        r = httpx.get(url, timeout=60, follow_redirects=True,
+                      headers={"User-Agent": "Mozilla/5.0 (data-analyst-bot; student project)"})
         return r.text[:8000]
     except Exception as e:
         return f"ERROR: {e}"
@@ -102,7 +103,10 @@ RULES — follow all of them:
    (https://data.gov.in/search?title=<keywords>), Wikipedia tables
    (pd.read_html handles them well), or direct CSV/XLSX/JSON links. If a
    fetch returns homepage-like HTML or an error, do NOT retry the same URL
-   — change the URL or the strategy.
+   — change the URL or the strategy. 
+   When using pd.read_html, fetch the page first with
+   requests.get(url, headers={"User-Agent": "Mozilla/5.0"}) and pass
+   response.text to pd.read_html, so the request carries a user-agent.
 3. In run_python you MUST print() anything you want to see; a bare
    expression on the last line shows nothing. Print your results and READ
    the output before drawing any conclusion from it.
