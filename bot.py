@@ -204,8 +204,7 @@ async def call_llm(messages: list) -> dict:
         r = await client.post(
             LLM_ENDPOINT,
             headers={"Authorization": f"Bearer {LLM_API_KEY}"},
-            json={"model": MODEL, "messages": messages, "tools": TOOLS,
-                  "temperature": 0},
+            json={"model": MODEL, "messages": messages, "tools": TOOLS},
         )
         r.raise_for_status()
         return r.json()["choices"][0]["message"]
