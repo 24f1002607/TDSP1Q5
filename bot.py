@@ -25,7 +25,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 LLM_API_KEY = os.environ["LLM_API_KEY"]
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "http://localhost:8000")
 LLM_ENDPOINT = "https://aipipe.org/openai/v1/chat/completions"
-MODEL = "gpt-4o-mini"
+MODEL = "gpt-5-mini"
 LOG_PATH = "run.jsonl"
 LOG_URL = f"{PUBLIC_URL}/run.jsonl"
 
@@ -91,20 +91,31 @@ TOOLS = [
 SYSTEM_PROMPT = """You are a careful data analyst agent answering via Telegram.
 
 RULES — follow all of them:
-1. NEVER answer from memory alone. You MUST ground every answer in actual
-   data: if the question embeds data, analyze it with run_python; if it
-   refers to a public dataset (MOSPI, data.gov.in, etc.), use fetch_url
-   and/or run_python (httpx + pandas) to retrieve and analyze real data
-   before answering. If retrieval fails after genuine attempts, answer from
-   your best knowledge but only as a last resort.
-2. Work step by step: locate the data, load it, compute, verify the result
-   makes sense, then answer.
-3. In multi-turn conversations, answer the LATEST message, using earlier
+1. NEVER answer from memory alone, and NEVER fabricate, simulate, or use
+   "sample"/"example"/placeholder data — inventing a dataset and analyzing
+   it is the worst possible failure. If you cannot obtain real data after
+   genuine attempts, answer from your best knowledge as a last resort and
+   never from an invented table.
+2. To find real data: fetching a site's homepage is useless (it returns
+   navigation HTML, not data). Use targeted sources instead — data.gov.in's
+   API (https://api.data.gov.in) or catalog search
+   (https://data.gov.in/search?title=<keywords>), Wikipedia tables
+   (pd.read_html handles them well), or direct CSV/XLSX/JSON links. If a
+   fetch returns homepage-like HTML or an error, do NOT retry the same URL
+   — change the URL or the strategy.
+3. In run_python you MUST print() anything you want to see; a bare
+   expression on the last line shows nothing. Print your results and READ
+   the output before drawing any conclusion from it.
+4. Work step by step: locate the data, load it, compute, then sanity-check.
+   If entity names look generic ("State A", "Category 1") or values look
+   fabricated, the data is WRONG — discard it and find the true source.
+   Verify your final answer is plausible before replying.
+5. In multi-turn conversations, answer the LATEST message, using earlier
    messages as context.
-4. Your FINAL reply must be EXACTLY one JSON object matching the shape the
-   question asks for, e.g. {"answer": {...}} — no prose, no markdown fences,
-   no explanations around it.
-5. Do not invent the log_url; the server fills it in."""
+6. Your FINAL reply must be EXACTLY one JSON object matching the shape the
+   question asks for, e.g. {"answer": {...}} — no prose, no markdown
+   fences, no explanations around it.
+7. Do not invent the log_url; the server fills it in."""
 
 
 async def call_llm(messages: list) -> dict:
