@@ -1,9 +1,12 @@
 """
-Data-Analyst Telegram Bot — v3.1.
-New in v3.1:
-  - Replies now match the exact JSON shape each question asks for: the
-    {"answer": ..., "log_url": ...} envelope is applied only when the
-    question mentions log_url; otherwise the bare shape is returned.
+Data-Analyst Telegram Bot — v3.2.
+New in v3.2:
+  - temperature=0 for more deterministic answers across runs.
+  - Recency rule made procedural: enumerate period columns, pick the
+    single most recent, use only that one.
+v3.1 recap: replies match the exact JSON shape each question asks for —
+the {"answer": ..., "log_url": ...} envelope only when the question
+mentions log_url; otherwise the bare shape.
 v3 recap: preloaded data helpers (read_tables, get_text) inside
 run_python; forced final answer when the round cap is hit.
 v2 recap: instant webhook ack + background task (no duplicate replies),
@@ -156,8 +159,9 @@ RULES — follow all of them:
    conclusions. Work step by step: locate, load, compute, sanity-check.
    If entity names look generic ("State A") or values look fabricated,
    the data is WRONG — discard it and find the true source.
-   When data has multiple time periods or survey years, use the MOST
-   RECENT period unless the question specifies otherwise.
+   When a table has multiple time-period columns, FIRST list all period
+   columns, explicitly identify the single most recent one, and use ONLY
+   that column for the answer (unless the question names a period).
 5. Be efficient: you have a limited number of steps. Prefer one
    read_tables call over many exploratory fetches.
 6. In multi-turn conversations, answer the LATEST message, using earlier
@@ -200,7 +204,8 @@ async def call_llm(messages: list) -> dict:
         r = await client.post(
             LLM_ENDPOINT,
             headers={"Authorization": f"Bearer {LLM_API_KEY}"},
-            json={"model": MODEL, "messages": messages, "tools": TOOLS},
+            json={"model": MODEL, "messages": messages, "tools": TOOLS,
+                  "temperature": 0},
         )
         r.raise_for_status()
         return r.json()["choices"][0]["message"]
