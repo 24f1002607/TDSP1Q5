@@ -156,6 +156,8 @@ RULES — follow all of them:
    conclusions. Work step by step: locate, load, compute, sanity-check.
    If entity names look generic ("State A") or values look fabricated,
    the data is WRONG — discard it and find the true source.
+   When data has multiple time periods or survey years, use the MOST
+   RECENT period unless the question specifies otherwise.
 5. Be efficient: you have a limited number of steps. Prefer one
    read_tables call over many exploratory fetches.
 6. In multi-turn conversations, answer the LATEST message, using earlier
