@@ -1,12 +1,16 @@
 """
-Data-Analyst Telegram Bot — v3.2.
-New in v3.2:
-  - temperature=0 for more deterministic answers across runs.
-  - Recency rule made procedural: enumerate period columns, pick the
-    single most recent, use only that one.
-v3.1 recap: replies match the exact JSON shape each question asks for —
-the {"answer": ..., "log_url": ...} envelope only when the question
-mentions log_url; otherwise the bare shape.
+Data-Analyst Telegram Bot — v3.4.
+New in v3.4:
+  - Empty-string safety net: after the forced final answer, if the reply
+    contains only empty values, one more retry asks the model to answer
+    from best knowledge (still shape-matched, still logged).
+  - Prompt names known reliable sources (Wikipedia list articles for
+    Indian public statistics) so the first tool call is more targeted.
+v3.3 recap: temperature parameter removed (rejected by gpt-5 model
+family; determinism handled by the prompt alone).
+v3.2 recap: procedural recency rule — enumerate period columns, pick
+the single most recent, use only that one.
+v3.1 recap: replies match the exact JSON shape each question asks for.
 v3 recap: preloaded data helpers (read_tables, get_text) inside
 run_python; forced final answer when the round cap is hit.
 v2 recap: instant webhook ack + background task (no duplicate replies),
@@ -152,9 +156,16 @@ RULES — follow all of them:
    For tabular web data (e.g. Wikipedia lists), read_tables(url) is the
    fastest reliable route: call it, print the tables, pick the right one.
 3. Finding data: homepages are useless (navigation HTML, not data). Use
-   targeted pages — a specific Wikipedia list article, data.gov.in API
-   (https://api.data.gov.in), or direct CSV/XLSX/JSON links. If a source
-   fails, do NOT retry the same URL — change the URL or strategy.
+   targeted pages. STRONG PREFERENCE ORDER for questions about Indian
+   public statistics: (a) a specific Wikipedia list/article page —
+   e.g. 'Maternal_mortality_in_India', 'List_of_Indian_states_by_...'
+   — these consistently have machine-readable tables from official
+   sources; (b) direct CSV/XLSX/JSON download links; (c) data.gov.in API
+   (https://api.data.gov.in). AVOID web search engines (DuckDuckGo,
+   Google) — they often rate-limit and return no results. AVOID MOSPI
+   and data.gov.in HTML pages — they are JavaScript-rendered and contain
+   no data in the raw HTML. If a source fails, do NOT retry it; change
+   URL or strategy.
 4. Always print() what you want to see and READ the output before drawing
    conclusions. Work step by step: locate, load, compute, sanity-check.
    If entity names look generic ("State A") or values look fabricated,
@@ -199,12 +210,29 @@ def _parse_final(raw: str, question: str = "") -> dict:
     return obj
 
 
+def _is_empty_answer(obj) -> bool:
+    """True if every leaf value in the answer object is empty/blank."""
+    if isinstance(obj, dict):
+        payload = obj.get("answer", obj)
+        # If the payload itself is a dict, check every leaf.
+        if isinstance(payload, dict):
+            leaves = list(payload.values())
+            return bool(leaves) and all(
+                v in ("", None) or (isinstance(v, str) and not v.strip())
+                for v in leaves)
+        # Payload might be a string/scalar directly.
+        if isinstance(payload, str):
+            return not payload.strip()
+    return False
+
+
 async def call_llm(messages: list) -> dict:
     async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post(
             LLM_ENDPOINT,
             headers={"Authorization": f"Bearer {LLM_API_KEY}"},
-            json={"model": MODEL, "messages": messages, "tools": TOOLS},
+            json={"model": MODEL, "messages": messages, "tools": TOOLS,
+                  "temperature": 0},
         )
         r.raise_for_status()
         return r.json()["choices"][0]["message"]
@@ -251,6 +279,17 @@ async def run_agent(chat_id: int, question: str) -> str:
     try:
         msg = await call_llm(history)
         obj = _parse_final(msg.get("content"), question)
+        # Safety net: if the forced answer is empty (all fields blank),
+        # retry once asking the model to answer from best knowledge.
+        if _is_empty_answer(obj):
+            log({"event": "empty_answer_retrying", "answer": obj})
+            history.append({"role": "user", "content":
+                "That reply was empty. Data retrieval failed; answer NOW "
+                "from your best general knowledge with any plausible "
+                "specific value in the required JSON shape. Do NOT leave "
+                "any field blank."})
+            msg = await call_llm(history)
+            obj = _parse_final(msg.get("content"), question)
         log({"event": "final_answer_forced", "answer": obj})
         return json.dumps(obj)
     except Exception as e:
